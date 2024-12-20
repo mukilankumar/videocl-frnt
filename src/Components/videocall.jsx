@@ -9,6 +9,7 @@ const VideoChat = () => {
   const [incomingCall, setIncomingCall] = useState(null);
   const [videoMuted, setVideoMuted] = useState(false);
   const [audioMuted, setAudioMuted] = useState(false);
+  const [currentCall, setCurrentCall] = useState(null);
 
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
@@ -20,10 +21,14 @@ const VideoChat = () => {
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:stun1.l.google.com:19302" },
+      {
+        urls: "turn:numb.viagenie.ca",
+        username: "webrtc@live.com",
+        credential: "muazkh"
+      }
     ],
   };
 
-  // Initialize WebSocket and local media
   useEffect(() => {
     const userID = prompt("Enter your user ID:");
     if (!userID) {
@@ -32,28 +37,74 @@ const VideoChat = () => {
     }
     setMyID(userID);
 
-    // Connect to signaling server
-    socket.current = io("https://videocl-bck.onrender.com");
+    // Connect to your signaling server
+    socket.current = io("http://localhost:5000");
 
-    // Initialize media and WebRTC
-    initializeMediaDevices();
-
-    // Socket event handlers
     socket.current.on("connect", () => {
       console.log("Connected to signaling server");
       socket.current.emit("join-room", userID);
     });
 
     socket.current.on("user-list", (users) => {
+      console.log("Received user list:", users);
       setUserList(users.filter(id => id !== userID));
     });
 
-    socket.current.on("offer", handleIncomingOffer);
-    socket.current.on("answer", handleAnswer);
-    socket.current.on("ice-candidate", handleNewICECandidate);
+    socket.current.on("incoming-call", ({ from }) => {
+      console.log("Incoming call from:", from);
+      setIncomingCall({ from });
+    });
+
+    socket.current.on("offer", async ({ offer, from }) => {
+      console.log("Received offer from:", from);
+      if (!peerConnection.current) {
+        createPeerConnection();
+      }
+      
+      try {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.current.createAnswer();
+        await peerConnection.current.setLocalDescription(answer);
+        
+        socket.current.emit("answer", {
+          answer,
+          to: from,
+          from: myID
+        });
+        
+        setCallAccepted(true);
+        setConnected(true);
+        setCurrentCall({ from });
+      } catch (err) {
+        console.error("Error handling offer:", err);
+      }
+    });
+
+    socket.current.on("answer", async ({ answer }) => {
+      try {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (err) {
+        console.error("Error setting remote description:", err);
+      }
+    });
+
+    socket.current.on("ice-candidate", async ({ candidate }) => {
+      try {
+        if (peerConnection.current) {
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+      } catch (err) {
+        console.error("Error adding ICE candidate:", err);
+      }
+    });
+
+    initializeMediaDevices();
 
     return () => {
       cleanupConnection();
+      if (socket.current) {
+        socket.current.disconnect();
+      }
     };
   }, []);
 
@@ -70,46 +121,63 @@ const VideoChat = () => {
       }
     } catch (err) {
       console.error("Error accessing media devices:", err);
+      alert("Failed to access camera and microphone. Please make sure they are connected and permissions are granted.");
     }
   };
 
   const createPeerConnection = () => {
-    peerConnection.current = new RTCPeerConnection(configuration);
+    try {
+      peerConnection.current = new RTCPeerConnection(configuration);
 
-    // Add local stream tracks to peer connection
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => {
-        peerConnection.current.addTrack(track, localStreamRef.current);
-      });
-    }
-
-    // Handle incoming tracks
-    peerConnection.current.ontrack = ({ streams: [stream] }) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = stream;
-      }
-    };
-
-    // Handle ICE candidates
-    peerConnection.current.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.current.emit("ice-candidate", {
-          candidate: event.candidate,
-          to: incomingCall ? incomingCall.from : callAccepted
+      // Add local tracks to the peer connection
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => {
+          peerConnection.current.addTrack(track, localStreamRef.current);
         });
       }
-    };
 
-    peerConnection.current.oniceconnectionstatechange = () => {
-      console.log("ICE Connection State:", peerConnection.current.iceConnectionState);
-    };
+      // Handle incoming tracks
+      peerConnection.current.ontrack = (event) => {
+        console.log("Received remote track");
+        if (remoteVideoRef.current && event.streams[0]) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      // Handle ICE candidates
+      peerConnection.current.onicecandidate = (event) => {
+        if (event.candidate) {
+          const to = currentCall?.to || currentCall?.from;
+          if (to) {
+            socket.current.emit("ice-candidate", {
+              candidate: event.candidate,
+              to
+            });
+          }
+        }
+      };
+
+      peerConnection.current.oniceconnectionstatechange = () => {
+        console.log("ICE Connection State:", peerConnection.current.iceConnectionState);
+        if (peerConnection.current.iceConnectionState === 'disconnected') {
+          cleanupConnection();
+        }
+      };
+
+      console.log("PeerConnection created successfully");
+    } catch (err) {
+      console.error("Error creating peer connection:", err);
+    }
   };
 
   const handleCall = async (toUserID) => {
-    setCallAccepted(toUserID);
-    createPeerConnection();
-
     try {
+      createPeerConnection();
+      setCurrentCall({ to: toUserID });
+
+      // Notify the other user about incoming call
+      socket.current.emit("incoming-call", { to: toUserID });
+
       const offer = await peerConnection.current.createOffer();
       await peerConnection.current.setLocalDescription(offer);
 
@@ -121,32 +189,18 @@ const VideoChat = () => {
       
       setConnected(true);
     } catch (err) {
-      console.error("Error creating offer:", err);
+      console.error("Error initiating call:", err);
       cleanupConnection();
     }
-  };
-
-  const handleIncomingOffer = async ({ offer, from }) => {
-    setIncomingCall({ from, offer });
   };
 
   const handleAnswerCall = async () => {
     if (!incomingCall) return;
 
-    createPeerConnection();
     try {
-      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(incomingCall.offer));
-      
-      const answer = await peerConnection.current.createAnswer();
-      await peerConnection.current.setLocalDescription(answer);
-
-      socket.current.emit("answer", {
-        answer,
-        to: incomingCall.from,
-        from: myID
-      });
-
-      setCallAccepted(incomingCall.from);
+      createPeerConnection();
+      setCurrentCall({ to: incomingCall.from });
+      setCallAccepted(true);
       setConnected(true);
       setIncomingCall(null);
     } catch (err) {
@@ -155,61 +209,23 @@ const VideoChat = () => {
     }
   };
 
-  const handleAnswer = async ({ answer }) => {
-    try {
-      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (err) {
-      console.error("Error setting remote description:", err);
-    }
-  };
-
-  const handleNewICECandidate = async ({ candidate }) => {
-    try {
-      if (peerConnection.current && candidate) {
-        await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
-      }
-    } catch (err) {
-      console.error("Error adding ICE candidate:", err);
-    }
-  };
-
   const cleanupConnection = () => {
     if (peerConnection.current) {
       peerConnection.current.close();
       peerConnection.current = null;
     }
-    if (socket.current) {
-      socket.current.disconnect();
+
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
     }
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => track.stop());
-    }
+
     setConnected(false);
     setCallAccepted(false);
     setIncomingCall(null);
+    setCurrentCall(null);
   };
 
-  const handleEndCall = () => {
-    cleanupConnection();
-  };
-
-  const toggleVideoMute = () => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getVideoTracks().forEach(track => {
-        track.enabled = !track.enabled;
-      });
-      setVideoMuted(!videoMuted);
-    }
-  };
-
-  const toggleAudioMute = () => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach(track => {
-        track.enabled = !track.enabled;
-      });
-      setAudioMuted(!audioMuted);
-    }
-  };
+  // ... rest of the component remains the same ...
 
   return (
     <div className="p-4">
@@ -247,7 +263,7 @@ const VideoChat = () => {
                 <button
                   onClick={() => handleCall(userID)}
                   className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-                  disabled={connected}
+                  disabled={connected || incomingCall}
                 >
                   Call {userID}
                 </button>
@@ -256,38 +272,56 @@ const VideoChat = () => {
           </ul>
         </div>
 
-        {connected && !callAccepted && !incomingCall && (
-          <p className="text-yellow-600">Waiting for the other user to accept...</p>
-        )}
-
         {incomingCall && (
           <div className="border p-4 rounded bg-yellow-50">
             <p>Incoming call from {incomingCall.from}...</p>
-            <button
-              onClick={handleAnswerCall}
-              className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
-            >
-              Answer
-            </button>
+            <div className="flex space-x-4 mt-2">
+              <button
+                onClick={handleAnswerCall}
+                className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
+              >
+                Answer
+              </button>
+              <button
+                onClick={() => setIncomingCall(null)}
+                className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
+              >
+                Reject
+              </button>
+            </div>
           </div>
         )}
 
-        {callAccepted && (
+        {connected && (
           <div className="flex space-x-4">
             <button
-              onClick={handleEndCall}
+              onClick={cleanupConnection}
               className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
             >
               End Call
             </button>
             <button
-              onClick={toggleAudioMute}
+              onClick={() => {
+                if (localStreamRef.current) {
+                  localStreamRef.current.getAudioTracks().forEach(track => {
+                    track.enabled = !track.enabled;
+                  });
+                  setAudioMuted(!audioMuted);
+                }
+              }}
               className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
             >
               {audioMuted ? "Unmute Audio" : "Mute Audio"}
             </button>
             <button
-              onClick={toggleVideoMute}
+              onClick={() => {
+                if (localStreamRef.current) {
+                  localStreamRef.current.getVideoTracks().forEach(track => {
+                    track.enabled = !track.enabled;
+                  });
+                  setVideoMuted(!videoMuted);
+                }
+              }}
               className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
             >
               {videoMuted ? "Unmute Video" : "Mute Video"}
